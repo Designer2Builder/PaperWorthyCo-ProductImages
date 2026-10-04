@@ -1,34 +1,24 @@
 import "server-only";
-import fs from "node:fs";
-import fsp from "node:fs/promises";
+import crypto from "node:crypto";
 import path from "node:path";
 import sharp from "sharp";
-import AdmZip from "adm-zip";
+import { copy, del, head, list, put } from "@vercel/blob";
 import type { IncomingFile } from "@/lib/types";
 
-const IMAGE_EXTENSIONS = new Set(["jpg", "jpeg", "png", "gif", "webp"]);
+export const IMAGE_CONTENT_TYPES = [
+  "image/jpeg",
+  "image/png",
+  "image/gif",
+  "image/webp",
+];
+export const MAX_UPLOAD_BYTES = 100 * 1024 * 1024; // 100MB per photo
 
-export const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), "data");
-export const PHOTOS_DIR = path.join(DATA_DIR, "photos");
-export const THUMBNAILS_DIR = path.join(DATA_DIR, "thumbnails");
-export const INCOMING_DIR = path.join(DATA_DIR, "incoming");
+const INCOMING_PREFIX = "incoming/";
+const INCOMING_PATHNAME =
+  /^incoming\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/[^/]+$/;
 
-export function ensureDirs(): void {
-  for (const dir of [DATA_DIR, PHOTOS_DIR, THUMBNAILS_DIR, INCOMING_DIR]) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
-}
-
-const CONTENT_TYPES: Record<string, string> = {
-  jpg: "image/jpeg",
-  jpeg: "image/jpeg",
-  png: "image/png",
-  gif: "image/gif",
-  webp: "image/webp",
-};
-
-export function contentTypeForExt(ext: string): string {
-  return CONTENT_TYPES[ext.toLowerCase()] || "application/octet-stream";
+export function isIncomingPathname(pathname: string): boolean {
+  return INCOMING_PATHNAME.test(pathname) && !pathname.includes("..");
 }
 
 export function extFromFilename(filename: string): string {
@@ -36,125 +26,101 @@ export function extFromFilename(filename: string): string {
   return ext || "jpg";
 }
 
-export function photoFilePath(id: number, ext: string): string {
-  return path.join(PHOTOS_DIR, `${id}.${ext}`);
-}
-
-export function thumbnailFilePath(id: number): string {
-  return path.join(THUMBNAILS_DIR, `${id}.webp`);
-}
-
-/** Sanitizes an uploaded filename to a safe basename with no path segments. */
-function sanitizeFilename(name: string): string {
-  const base = path.basename(name).replace(/[^\w.\- ]+/g, "_");
-  return base || "file";
-}
-
 export async function listIncomingFiles(): Promise<IncomingFile[]> {
-  ensureDirs();
-  const entries = await fsp.readdir(INCOMING_DIR, { withFileTypes: true });
-  const files = entries.filter((e) => e.isFile());
-  const stats = await Promise.all(
-    files.map(async (e) => {
-      const stat = await fsp.stat(path.join(INCOMING_DIR, e.name));
-      return { name: e.name, size: stat.size };
-    })
-  );
-  return stats.sort((a, b) => a.name.localeCompare(b.name));
-}
-
-/** Writes a buffer into the incoming staging directory, avoiding name collisions. */
-export async function writeIncomingFile(
-  originalName: string,
-  buffer: Buffer
-): Promise<string> {
-  ensureDirs();
-  const safeName = sanitizeFilename(originalName);
-  const ext = path.extname(safeName);
-  const base = path.basename(safeName, ext);
-
-  let candidate = safeName;
-  let counter = 2;
-  while (
-    await fsp
-      .access(path.join(INCOMING_DIR, candidate))
-      .then(() => true)
-      .catch(() => false)
-  ) {
-    candidate = `${base}-${counter}${ext}`;
-    counter += 1;
-  }
-
-  await fsp.writeFile(path.join(INCOMING_DIR, candidate), buffer);
-  return candidate;
-}
-
-/**
- * Extracts image entries from a zip archive (e.g. a Google Drive folder
- * export) into the incoming staging directory. Non-image entries, folders,
- * and junk files like __MACOSX/.DS_Store are silently skipped.
- */
-export async function extractZipToIncoming(
-  buffer: Buffer
-): Promise<{ saved: string[]; skipped: number }> {
-  ensureDirs();
-  const zip = new AdmZip(buffer);
-  const saved: string[] = [];
-  let skipped = 0;
-
-  for (const entry of zip.getEntries()) {
-    if (entry.isDirectory) continue;
-    if (entry.entryName.startsWith("__MACOSX/")) continue;
-    if (entry.name.startsWith(".")) continue;
-
-    const ext = path.extname(entry.name).slice(1).toLowerCase();
-    if (!IMAGE_EXTENSIONS.has(ext)) {
-      skipped += 1;
-      continue;
+  const files: IncomingFile[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = await list({ prefix: INCOMING_PREFIX, cursor, limit: 1000 });
+    for (const blob of page.blobs) {
+      if (!isIncomingPathname(blob.pathname)) continue;
+      files.push({
+        pathname: blob.pathname,
+        name: path.posix.basename(blob.pathname),
+        size: blob.size,
+      });
     }
-
-    const name = await writeIncomingFile(entry.name, entry.getData());
-    saved.push(name);
-  }
-
-  return { saved, skipped };
+    cursor = page.hasMore ? page.cursor : undefined;
+  } while (cursor);
+  return files.sort((a, b) => a.name.localeCompare(b.name));
 }
 
-export async function removeIncomingFile(name: string): Promise<void> {
-  const safeName = sanitizeFilename(name);
-  await fsp.rm(path.join(INCOMING_DIR, safeName), { force: true });
+export async function removeIncomingFile(pathname: string): Promise<void> {
+  if (!isIncomingPathname(pathname)) return;
+  await del(pathname);
 }
 
 export async function clearIncomingFiles(): Promise<void> {
   const files = await listIncomingFiles();
-  await Promise.all(files.map((f) => removeIncomingFile(f.name)));
+  if (files.length > 0) await del(files.map((f) => f.pathname));
 }
 
-export async function readIncomingFile(name: string): Promise<Buffer> {
-  const safeName = sanitizeFilename(name);
-  return fsp.readFile(path.join(INCOMING_DIR, safeName));
-}
+/**
+ * Moves a staged upload into permanent storage, generates its thumbnail, and
+ * reads its metadata. The staged blob is removed once both copies exist.
+ */
+export async function promoteIncomingFile(pathname: string): Promise<{
+  name: string;
+  ext: string;
+  size: number;
+  photoUrl: string;
+  thumbnailUrl: string;
+  width: number | null;
+  height: number | null;
+  originalCreatedAt: string | null;
+}> {
+  const incoming = await head(pathname);
+  const res = await fetch(incoming.url, { cache: "no-store" });
+  if (!res.ok) throw new Error(`Could not read upload (status ${res.status})`);
+  const buffer = Buffer.from(await res.arrayBuffer());
 
-/** Moves a staged incoming file into permanent photo storage under its catalog id. */
-export async function moveIncomingToPhoto(
-  incomingName: string,
-  id: number,
-  ext: string
-): Promise<void> {
-  const safeName = sanitizeFilename(incomingName);
-  ensureDirs();
-  await fsp.rename(
-    path.join(INCOMING_DIR, safeName),
-    photoFilePath(id, ext)
-  );
-}
+  const name = path.posix.basename(pathname);
+  const ext = extFromFilename(name);
+  const key = crypto.randomUUID();
 
-export async function generateThumbnail(id: number, ext: string): Promise<void> {
-  ensureDirs();
-  await sharp(photoFilePath(id, ext))
+  const thumbnail = await sharp(buffer)
     .resize(400, 400, { fit: "inside", withoutEnlargement: true })
     .webp({ quality: 80 })
-    .toFile(thumbnailFilePath(id));
+    .toBuffer();
+
+  const results = await Promise.allSettled([
+    copy(incoming.url, `photos/${key}.${ext}`, {
+      access: "public",
+      addRandomSuffix: true,
+      contentType: incoming.contentType,
+    }),
+    put(`thumbnails/${key}.webp`, thumbnail, {
+      access: "public",
+      addRandomSuffix: true,
+      contentType: "image/webp",
+    }),
+  ]);
+  const failure = results.find((r) => r.status === "rejected");
+  if (failure) {
+    await deleteBlobs(
+      results.map((r) => (r.status === "fulfilled" ? r.value.url : ""))
+    );
+    throw failure.reason;
+  }
+  const [photoBlob, thumbnailBlob] = results.map(
+    (r) => (r as PromiseFulfilledResult<{ url: string }>).value
+  );
+
+  const metadata = await getImageMetadata(buffer);
+  await del(incoming.url);
+
+  return {
+    name,
+    ext,
+    size: incoming.size,
+    photoUrl: photoBlob.url,
+    thumbnailUrl: thumbnailBlob.url,
+    ...metadata,
+  };
+}
+
+export async function deleteBlobs(urls: string[]): Promise<void> {
+  const present = urls.filter(Boolean);
+  if (present.length > 0) await del(present);
 }
 
 function normalizeImageDate(raw: string): string | null {
@@ -274,13 +240,13 @@ function parseXmpOriginalDate(xmp: string | undefined): string | null {
   return null;
 }
 
-export async function getImageMetadata(filePath: string): Promise<{
+export async function getImageMetadata(image: Buffer): Promise<{
   width: number | null;
   height: number | null;
   originalCreatedAt: string | null;
 }> {
   try {
-    const metadata = await sharp(filePath).metadata();
+    const metadata = await sharp(image).metadata();
     const originalCreatedAt =
       parseExifDate(metadata.exif, [0x9003, 0x9004]) ||
       parseXmpOriginalDate(metadata.xmpAsString) ||
@@ -293,11 +259,4 @@ export async function getImageMetadata(filePath: string): Promise<{
   } catch {
     return { width: null, height: null, originalCreatedAt: null };
   }
-}
-
-export async function deletePhotoFiles(id: number, ext: string): Promise<void> {
-  await Promise.all([
-    fsp.rm(photoFilePath(id, ext), { force: true }),
-    fsp.rm(thumbnailFilePath(id), { force: true }),
-  ]);
 }

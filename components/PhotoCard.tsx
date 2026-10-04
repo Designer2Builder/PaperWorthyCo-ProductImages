@@ -26,7 +26,7 @@ export function PhotoCard({
         <div className="aspect-square w-full overflow-hidden bg-neutral-100">
           {/* eslint-disable-next-line @next/next/no-img-element */}
           <img
-            src={`/api/photos/${photo.id}/thumbnail`}
+            src={photo.thumbnail_url}
             alt={photo.display_name}
             className="h-full w-full object-cover transition group-hover:scale-105"
             loading="lazy"

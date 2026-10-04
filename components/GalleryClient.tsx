@@ -59,14 +59,12 @@ export function GalleryClient() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ ids: Array.from(selected) }),
     });
-    if (!res.ok) return;
-    const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "photos.zip";
-    a.click();
-    URL.revokeObjectURL(url);
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.url) {
+      alert(data.error || "Could not prepare the download.");
+      return;
+    }
+    window.location.href = data.url;
   }
 
   async function handleSetInteriorPages(interiorPages: string) {

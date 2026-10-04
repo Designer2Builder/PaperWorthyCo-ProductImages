@@ -11,9 +11,9 @@ export async function GET() {
 }
 
 export async function DELETE(request: NextRequest) {
-  const name = request.nextUrl.searchParams.get("name");
-  if (name) {
-    await removeIncomingFile(name);
+  const pathname = request.nextUrl.searchParams.get("pathname");
+  if (pathname) {
+    await removeIncomingFile(pathname);
   } else {
     await clearIncomingFiles();
   }

@@ -84,6 +84,22 @@ export function PhotoDetailClient({ id }: { id: string }) {
     setSaving(false);
   }
 
+  async function handleDownload() {
+    if (!photo) return;
+    const a = document.createElement("a");
+    a.download = `${photo.display_name}.${photo.file_ext}`;
+    try {
+      const res = await fetch(photo.photo_url);
+      if (!res.ok) throw new Error();
+      a.href = URL.createObjectURL(await res.blob());
+      a.click();
+      URL.revokeObjectURL(a.href);
+    } catch {
+      a.href = `${photo.photo_url}?download=1`;
+      a.click();
+    }
+  }
+
   async function handleDelete() {
     if (!confirm("Delete this photo? This cannot be undone.")) return;
     await fetch(`/api/photos/${id}`, { method: "DELETE" });
@@ -119,7 +135,7 @@ export function PhotoDetailClient({ id }: { id: string }) {
         <div className="overflow-hidden rounded-lg border border-neutral-200 bg-neutral-100 md:self-start">
           {/* eslint-disable-next-line @next/next/no-img-element */}
           <img
-            src={`/api/photos/${photo.id}/file`}
+            src={photo.photo_url}
             alt={photo.display_name}
             className="h-full w-full object-contain"
           />
@@ -140,12 +156,12 @@ export function PhotoDetailClient({ id }: { id: string }) {
           </div>
 
           <div className="mt-6 flex items-center gap-3">
-            <a
-              href={`/api/photos/${photo.id}/file?download=1`}
+            <button
+              onClick={handleDownload}
               className="rounded-md border border-neutral-300 px-3 py-2 text-sm font-medium text-neutral-700 hover:bg-neutral-100"
             >
               Download
-            </a>
+            </button>
             <button
               onClick={handleDelete}
               className="rounded-md border border-red-300 px-3 py-2 text-sm font-medium text-red-600 hover:bg-red-50"

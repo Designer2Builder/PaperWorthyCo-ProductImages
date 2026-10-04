@@ -1,53 +1,41 @@
 import { NextRequest, NextResponse } from "next/server";
-import { isAuthenticated } from "@/lib/auth";
-import { writeIncomingFile, extractZipToIncoming } from "@/lib/storage";
+import { handleUpload, type HandleUploadBody } from "@vercel/blob/client";
+import {
+  IMAGE_CONTENT_TYPES,
+  MAX_UPLOAD_BYTES,
+  isIncomingPathname,
+} from "@/lib/storage";
 
-// Excluded from proxy.ts's matcher (see proxy.ts) so large uploads aren't
-// capped by its in-memory body-buffering limit, so auth is checked here.
+// Issues short-lived tokens so the browser can upload photos straight to
+// Vercel Blob, since Vercel caps function request bodies at 4.5MB.
 export async function POST(request: NextRequest) {
-  if (!(await isAuthenticated())) {
-    return NextResponse.json({ error: "Not authenticated" }, { status: 401 });
+  let body: HandleUploadBody;
+  try {
+    body = (await request.json()) as HandleUploadBody;
+  } catch {
+    return NextResponse.json({ error: "Invalid request" }, { status: 400 });
   }
 
-  let formData: FormData;
   try {
-    formData = await request.formData();
-  } catch {
+    const result = await handleUpload({
+      body,
+      request,
+      onBeforeGenerateToken: async (pathname) => {
+        if (!isIncomingPathname(pathname)) {
+          throw new Error("Invalid upload path");
+        }
+        return {
+          allowedContentTypes: IMAGE_CONTENT_TYPES,
+          maximumSizeInBytes: MAX_UPLOAD_BYTES,
+          addRandomSuffix: false,
+        };
+      },
+    });
+    return NextResponse.json(result);
+  } catch (err) {
     return NextResponse.json(
-      { error: "Upload was too large or malformed." },
+      { error: (err as Error).message },
       { status: 400 }
     );
   }
-
-  const files = formData
-    .getAll("files")
-    .filter((f): f is File => f instanceof File);
-
-  if (files.length === 0) {
-    return NextResponse.json({ error: "No files provided" }, { status: 400 });
-  }
-
-  const saved: string[] = [];
-  let skipped = 0;
-
-  for (const file of files) {
-    const buffer = Buffer.from(await file.arrayBuffer());
-
-    if (file.name.toLowerCase().endsWith(".zip")) {
-      try {
-        const result = await extractZipToIncoming(buffer);
-        saved.push(...result.saved);
-        skipped += result.skipped;
-      } catch {
-        return NextResponse.json(
-          { error: `Could not read "${file.name}" as a zip file.` },
-          { status: 400 }
-        );
-      }
-    } else {
-      saved.push(await writeIncomingFile(file.name, buffer));
-    }
-  }
-
-  return NextResponse.json({ saved, skipped });
 }

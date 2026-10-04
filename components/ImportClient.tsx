@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
+import { upload } from "@vercel/blob/client";
 import type { IncomingFile } from "@/lib/types";
 import {
   EMPTY_PRODUCT_FORM,
@@ -10,8 +11,30 @@ import {
   type ProductFormValues,
 } from "@/components/ProductFieldsForm";
 
-const BATCH_SIZE = 10;
-const MAX_ZIP_SIZE = 250 * 1024 * 1024; // 250MB
+const UPLOAD_CONCURRENCY = 3;
+const IMAGE_FILE = /\.(jpe?g|png|gif|webp)$/i;
+
+function safeFilename(name: string): string {
+  return name.replace(/[^\w.\- ]+/g, "_") || "photo";
+}
+
+async function runWithConcurrency<T>(
+  items: T[],
+  limit: number,
+  task: (item: T) => Promise<void>
+): Promise<void> {
+  let next = 0;
+  async function worker() {
+    while (next < items.length) {
+      const item = items[next];
+      next += 1;
+      await task(item);
+    }
+  }
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, worker)
+  );
+}
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -27,7 +50,10 @@ export function ImportClient() {
     done: number;
     total: number;
   } | null>(null);
-  const [importing, setImporting] = useState(false);
+  const [importProgress, setImportProgress] = useState<{
+    done: number;
+    total: number;
+  } | null>(null);
   const [importResult, setImportResult] = useState<{
     imported: number;
     failed: { name: string; error: string }[];
@@ -57,64 +83,46 @@ export function ImportClient() {
 
   async function handleFilesSelected(fileList: FileList | null) {
     if (!fileList || fileList.length === 0) return;
-    const allFiles = Array.from(fileList);
+    const selectedFiles = Array.from(fileList);
+    const images = selectedFiles.filter((f) => IMAGE_FILE.test(f.name));
     setImportResult(null);
-    setUploadSkipped(0);
+    setUploadSkipped(selectedFiles.length - images.length);
     setUploadError(null);
 
-    const oversizedZip = allFiles.find(
-      (f) => f.name.toLowerCase().endsWith(".zip") && f.size > MAX_ZIP_SIZE
-    );
-    if (oversizedZip) {
-      setUploadError(
-        `"${oversizedZip.name}" is ${formatBytes(oversizedZip.size)} — too large to upload as a zip. ` +
-          "Unzip it on your computer first, then select the image files directly (they upload in small batches)."
-      );
-      if (fileInputRef.current) fileInputRef.current.value = "";
-      return;
-    }
+    let done = 0;
+    const failures: string[] = [];
+    setUploadProgress({ done, total: images.length });
 
-    setUploadProgress({ done: 0, total: allFiles.length });
-
-    let skipped = 0;
-    for (let i = 0; i < allFiles.length; i += BATCH_SIZE) {
-      const batch = allFiles.slice(i, i + BATCH_SIZE);
-      const formData = new FormData();
-      batch.forEach((file) => formData.append("files", file));
-
+    await runWithConcurrency(images, UPLOAD_CONCURRENCY, async (file) => {
       try {
-        const res = await fetch("/api/incoming/upload", {
-          method: "POST",
-          body: formData,
-        });
-        const data = await res.json().catch(() => ({}));
-
-        if (!res.ok) {
-          setUploadError(
-            data.error || `Upload failed (status ${res.status}).`
-          );
-          break;
-        }
-        skipped += data.skipped ?? 0;
-      } catch {
-        setUploadError("Upload failed. Check your connection and try again.");
-        break;
+        await upload(
+          `incoming/${crypto.randomUUID()}/${safeFilename(file.name)}`,
+          file,
+          {
+            access: "public",
+            handleUploadUrl: "/api/incoming/upload",
+            multipart: file.size > 5 * 1024 * 1024,
+          }
+        );
+      } catch (err) {
+        failures.push(`${file.name}: ${(err as Error).message}`);
       }
+      done += 1;
+      setUploadProgress({ done, total: images.length });
+    });
 
-      setUploadProgress({
-        done: Math.min(i + BATCH_SIZE, allFiles.length),
-        total: allFiles.length,
-      });
+    if (failures.length > 0) {
+      setUploadError(
+        `${failures.length} file${failures.length === 1 ? "" : "s"} failed to upload. ${failures.join("; ")}`
+      );
     }
-
-    setUploadSkipped(skipped);
     setUploadProgress(null);
     if (fileInputRef.current) fileInputRef.current.value = "";
     await loadFiles();
   }
 
-  async function handleRemove(name: string) {
-    await fetch(`/api/incoming?name=${encodeURIComponent(name)}`, {
+  async function handleRemove(pathname: string) {
+    await fetch(`/api/incoming?pathname=${encodeURIComponent(pathname)}`, {
       method: "DELETE",
     });
     await loadFiles();
@@ -129,17 +137,36 @@ export function ImportClient() {
   }
 
   async function handleImportAll() {
-    setImporting(true);
+    const toImport = files;
+    const fields = productFormToPayload(productValues, "import");
+    let imported = 0;
+    const failed: { name: string; error: string }[] = [];
     setImportResult(null);
-    const res = await fetch("/api/incoming/import", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(productFormToPayload(productValues, "import")),
-    });
-    const data = await res.json();
-    setImportResult(data);
-    setImporting(false);
-    if (data.imported > 0) setProductValues(EMPTY_PRODUCT_FORM);
+    setImportProgress({ done: 0, total: toImport.length });
+
+    for (const [i, file] of toImport.entries()) {
+      try {
+        const res = await fetch("/api/incoming/import", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ...fields, pathname: file.pathname }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok) imported += 1;
+        else
+          failed.push({
+            name: file.name,
+            error: data.error || `status ${res.status}`,
+          });
+      } catch {
+        failed.push({ name: file.name, error: "Network error" });
+      }
+      setImportProgress({ done: i + 1, total: toImport.length });
+    }
+
+    setImportResult({ imported, failed });
+    setImportProgress(null);
+    if (imported > 0) setProductValues(EMPTY_PRODUCT_FORM);
     await loadFiles();
   }
 
@@ -149,11 +176,10 @@ export function ImportClient() {
         Bulk import photos
       </h1>
       <p className="mt-1 text-sm text-neutral-500">
-        Select photos exported from Google Drive (individual images, or a
-        .zip of a folder under ~250MB), review what&apos;s staged below, then
-        import them all into the catalog. For a bigger export, unzip it on
-        your computer first and select the image files directly &mdash;
-        those upload in small batches, so there&apos;s no size limit.
+        Select photos (JPG, PNG, GIF, or WebP), review what&apos;s staged
+        below, then import them all into the catalog. For a Google Drive
+        export, unzip it on your computer first and select the image files
+        inside.
       </p>
 
       <div className="mt-4 rounded-lg border border-dashed border-neutral-300 bg-white p-6 text-center">
@@ -161,7 +187,7 @@ export function ImportClient() {
           ref={fileInputRef}
           type="file"
           multiple
-          accept="image/*,.zip,application/zip"
+          accept="image/jpeg,image/png,image/gif,image/webp"
           onChange={(e) => handleFilesSelected(e.target.files)}
           className="text-sm"
         />
@@ -173,7 +199,7 @@ export function ImportClient() {
         {!uploadProgress && uploadSkipped > 0 && (
           <p className="mt-2 text-sm text-neutral-500">
             Skipped {uploadSkipped} non-image file
-            {uploadSkipped === 1 ? "" : "s"} found in the zip.
+            {uploadSkipped === 1 ? "" : "s"}.
           </p>
         )}
         {uploadError && (
@@ -229,7 +255,7 @@ export function ImportClient() {
         <ul className="mt-3 divide-y divide-neutral-200 rounded-md border border-neutral-200 bg-white">
           {files.map((file) => (
             <li
-              key={file.name}
+              key={file.pathname}
               className="flex items-center justify-between px-3 py-2 text-sm"
             >
               <span className="truncate text-neutral-800">{file.name}</span>
@@ -238,7 +264,7 @@ export function ImportClient() {
                   {formatBytes(file.size)}
                 </span>
                 <button
-                  onClick={() => handleRemove(file.name)}
+                  onClick={() => handleRemove(file.pathname)}
                   className="text-neutral-400 hover:text-red-600"
                 >
                   Remove
@@ -267,11 +293,11 @@ export function ImportClient() {
           </div>
           <button
             onClick={handleImportAll}
-            disabled={importing}
+            disabled={importProgress !== null}
             className="mt-4 rounded-md bg-neutral-900 px-3 py-2 text-sm font-medium text-white disabled:opacity-50"
           >
-            {importing
-              ? "Importing..."
+            {importProgress
+              ? `Importing ${importProgress.done} / ${importProgress.total}...`
               : `Import ${files.length} photo${files.length === 1 ? "" : "s"}`}
           </button>
         </div>

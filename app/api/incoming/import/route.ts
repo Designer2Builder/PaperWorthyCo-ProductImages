@@ -1,69 +1,64 @@
 import { NextRequest, NextResponse } from "next/server";
 import path from "node:path";
+import { insertPhoto, updatePhoto } from "@/lib/db";
 import {
-  insertPhoto,
-  deletePhoto,
-  updatePhoto,
-  updatePhotoDimensions,
-  updatePhotoOriginalCreatedAt,
-} from "@/lib/db";
-import {
-  listIncomingFiles,
-  moveIncomingToPhoto,
-  generateThumbnail,
-  getImageMetadata,
-  extFromFilename,
-  photoFilePath,
+  deleteBlobs,
+  isIncomingPathname,
+  promoteIncomingFile,
 } from "@/lib/storage";
 import { parseProductUpdates } from "@/lib/parseProductUpdates";
 
+export const maxDuration = 60;
+
+/** Imports one staged file; the client calls this once per file. */
 export async function POST(request: NextRequest) {
-  let body: Record<string, unknown> = {};
+  let body: Record<string, unknown>;
   try {
-    const text = await request.text();
-    if (text) body = JSON.parse(text) as Record<string, unknown>;
+    body = (await request.json()) as Record<string, unknown>;
   } catch {
     return NextResponse.json({ error: "Invalid request" }, { status: 400 });
   }
 
-  const updates = parseProductUpdates(body);
-  const files = await listIncomingFiles();
-  let importedCount = 0;
-  const failed: { name: string; error: string }[] = [];
-
-  for (const file of files) {
-    const ext = extFromFilename(file.name);
-    const displayName = path.basename(file.name, path.extname(file.name));
-
-    const photo = insertPhoto({
-      display_name: updates.display_name || displayName,
-      original_filename: file.name,
-      category: "Uncategorized",
-      file_ext: ext,
-      file_size: file.size,
-      width: null,
-      height: null,
-    });
-
-    try {
-      await moveIncomingToPhoto(file.name, photo.id, ext);
-      const { width, height, originalCreatedAt } = await getImageMetadata(
-        photoFilePath(photo.id, ext)
-      );
-      updatePhotoDimensions(photo.id, width, height);
-      updatePhotoOriginalCreatedAt(photo.id, originalCreatedAt ?? "");
-      const fieldUpdates = { ...updates };
-      delete fieldUpdates.display_name;
-      if (Object.keys(fieldUpdates).length > 0) {
-        updatePhoto(photo.id, fieldUpdates);
-      }
-      await generateThumbnail(photo.id, ext);
-      importedCount += 1;
-    } catch (err) {
-      deletePhoto(photo.id);
-      failed.push({ name: file.name, error: (err as Error).message });
-    }
+  const pathname = body.pathname;
+  if (typeof pathname !== "string" || !isIncomingPathname(pathname)) {
+    return NextResponse.json({ error: "Invalid file" }, { status: 400 });
   }
 
-  return NextResponse.json({ imported: importedCount, failed });
+  const updates = parseProductUpdates(body);
+  delete updates.display_name;
+
+  let promoted: Awaited<ReturnType<typeof promoteIncomingFile>>;
+  try {
+    promoted = await promoteIncomingFile(pathname);
+  } catch (err) {
+    return NextResponse.json(
+      { error: (err as Error).message },
+      { status: 500 }
+    );
+  }
+
+  try {
+    const photo = await insertPhoto({
+      display_name: path.basename(promoted.name, path.extname(promoted.name)),
+      original_filename: promoted.name,
+      file_ext: promoted.ext,
+      file_size: promoted.size,
+      photo_url: promoted.photoUrl,
+      thumbnail_url: promoted.thumbnailUrl,
+      width: promoted.width,
+      height: promoted.height,
+      original_created_at: promoted.originalCreatedAt ?? "",
+    });
+    const saved =
+      Object.keys(updates).length > 0
+        ? await updatePhoto(photo.id, updates)
+        : photo;
+    return NextResponse.json({ photo: saved });
+  } catch (err) {
+    await deleteBlobs([promoted.photoUrl, promoted.thumbnailUrl]);
+    return NextResponse.json(
+      { error: (err as Error).message },
+      { status: 500 }
+    );
+  }
 }

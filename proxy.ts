@@ -21,11 +21,5 @@ export function proxy(request: NextRequest) {
 }
 
 export const config = {
-  // /api/incoming/upload is excluded because proxy buffers the entire
-  // request body in memory (capped by proxyClientMaxBodySize) to allow
-  // both proxy and the route handler to read it, which caps how large a
-  // photo zip upload can be. That route checks auth itself instead.
-  matcher: [
-    "/((?!_next/static|_next/image|favicon.ico|api/incoming/upload).*)",
-  ],
+  matcher: ["/((?!_next/static|_next/image|favicon.ico).*)"],
 };

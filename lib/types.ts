@@ -2,7 +2,6 @@ export interface Photo {
   id: number;
   display_name: string;
   original_filename: string;
-  category: string;
   series_name: string;
   series_release_date: string | null;
   colors: string[];
@@ -21,6 +20,8 @@ export interface Photo {
   raw_material: string;
   file_ext: string;
   file_size: number;
+  photo_url: string;
+  thumbnail_url: string;
   width: number | null;
   height: number | null;
   original_created_at: string | null;
@@ -29,6 +30,8 @@ export interface Photo {
 }
 
 export interface IncomingFile {
+  /** Blob pathname, e.g. `incoming/<uuid>/IMG_1234.jpg`. */
+  pathname: string;
   name: string;
   size: number;
 }

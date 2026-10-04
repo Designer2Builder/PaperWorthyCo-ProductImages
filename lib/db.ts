@@ -1,75 +1,90 @@
 import "server-only";
-import Database from "better-sqlite3";
-import path from "node:path";
 import fs from "node:fs";
-import { DATA_DIR } from "@/lib/storage";
+import { createClient, type InValue, type ResultSet } from "@libsql/client";
 import { parseColors } from "@/lib/productFields";
 import type { Photo } from "@/lib/types";
 
-fs.mkdirSync(DATA_DIR, { recursive: true });
+const LOCAL_DB_URL = "file:data/catalog.db";
 
-const db = new Database(path.join(DATA_DIR, "app.db"));
-db.pragma("journal_mode = WAL");
+function databaseUrl(): string {
+  const url = process.env.TURSO_DATABASE_URL;
+  if (url) return url;
+  if (process.env.VERCEL) {
+    throw new Error("TURSO_DATABASE_URL environment variable is not set");
+  }
+  fs.mkdirSync("data", { recursive: true });
+  return LOCAL_DB_URL;
+}
 
-db.exec(`
+const client = createClient({
+  url: databaseUrl(),
+  authToken: process.env.TURSO_AUTH_TOKEN,
+});
+
+const SCHEMA = `
   CREATE TABLE IF NOT EXISTS photos (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     display_name TEXT NOT NULL,
     original_filename TEXT NOT NULL,
-    category TEXT NOT NULL DEFAULT 'Uncategorized',
+    series_name TEXT NOT NULL DEFAULT '',
+    series_release_date TEXT,
+    colors TEXT NOT NULL DEFAULT '[]',
+    description TEXT NOT NULL DEFAULT '',
+    photo_type TEXT NOT NULL DEFAULT '',
+    page_number INTEGER,
+    notebook_type TEXT NOT NULL DEFAULT '',
+    notebook_count TEXT NOT NULL DEFAULT '',
+    interior_pages TEXT NOT NULL DEFAULT '',
+    retail_price REAL,
+    wholesale_price REAL,
+    wholesale_minimum INTEGER,
+    cogs REAL,
+    inventory INTEGER,
+    inventory_check_date TEXT,
+    raw_material TEXT NOT NULL DEFAULT '',
     file_ext TEXT NOT NULL,
     file_size INTEGER NOT NULL,
+    photo_url TEXT NOT NULL,
+    thumbnail_url TEXT NOT NULL,
     width INTEGER,
     height INTEGER,
+    original_created_at TEXT,
     imported_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
-  CREATE INDEX IF NOT EXISTS idx_photos_category ON photos(category);
-`);
+  CREATE INDEX IF NOT EXISTS idx_photos_interior_pages ON photos(interior_pages);
+  CREATE INDEX IF NOT EXISTS idx_photos_imported_at ON photos(imported_at);
+`;
 
-function ensureColumn(name: string, definition: string) {
-  const columns = db.pragma("table_info(photos)") as { name: string }[];
-  if (!columns.some((column) => column.name === name)) {
-    db.exec(`ALTER TABLE photos ADD COLUMN ${name} ${definition}`);
-  }
+let schemaReady: Promise<void> | null = null;
+
+function ensureSchema(): Promise<void> {
+  schemaReady ??= client.executeMultiple(SCHEMA).catch((err) => {
+    schemaReady = null;
+    throw err;
+  });
+  return schemaReady;
 }
 
-ensureColumn("series_name", "TEXT NOT NULL DEFAULT ''");
-ensureColumn("series_release_date", "TEXT");
-ensureColumn("colors", "TEXT NOT NULL DEFAULT '[]'");
-ensureColumn("description", "TEXT NOT NULL DEFAULT ''");
-ensureColumn("page_number", "INTEGER");
-ensureColumn("notebook_type", "TEXT NOT NULL DEFAULT ''");
-ensureColumn("notebook_count", "TEXT NOT NULL DEFAULT ''");
-ensureColumn("original_created_at", "TEXT");
-ensureColumn("interior_pages", "TEXT NOT NULL DEFAULT ''");
-ensureColumn("retail_price", "REAL");
-ensureColumn("wholesale_price", "REAL");
-ensureColumn("wholesale_minimum", "INTEGER");
-ensureColumn("cogs", "REAL");
-ensureColumn("photo_type", "TEXT NOT NULL DEFAULT ''");
-ensureColumn("inventory", "INTEGER");
-ensureColumn("inventory_check_date", "TEXT");
-ensureColumn("raw_material", "TEXT NOT NULL DEFAULT ''");
-
-db.prepare(
-  "UPDATE photos SET notebook_count = 'Pair' WHERE notebook_count = 'Duo'"
-).run();
+async function execute(
+  sql: string,
+  args: InValue[] | Record<string, InValue> = []
+): Promise<ResultSet> {
+  await ensureSchema();
+  return client.execute({ sql, args });
+}
 
 interface PhotoRow extends Omit<Photo, "colors"> {
   colors: string;
 }
 
-function mapPhoto(row: PhotoRow | undefined): Photo | undefined {
-  if (!row) return undefined;
-  return {
-    ...row,
-    colors: parseColors(row.colors),
-  };
-}
-
-function mapPhotos(rows: PhotoRow[]): Photo[] {
-  return rows.map((row) => mapPhoto(row)!);
+function rowsToPhotos(result: ResultSet): Photo[] {
+  return result.rows.map((row) => {
+    const record = Object.fromEntries(
+      result.columns.map((column, i) => [column, row[i]])
+    ) as unknown as PhotoRow;
+    return { ...record, colors: parseColors(record.colors) };
+  });
 }
 
 export interface PhotoFilters {
@@ -77,68 +92,71 @@ export interface PhotoFilters {
   interior_pages?: string;
 }
 
-export function listPhotos(filters: PhotoFilters = {}): Photo[] {
+export async function listPhotos(filters: PhotoFilters = {}): Promise<Photo[]> {
   const clauses: string[] = [];
-  const params: Record<string, string> = {};
+  const args: Record<string, InValue> = {};
 
   if (filters.q) {
     clauses.push(
-      "(display_name LIKE @q OR original_filename LIKE @q OR series_name LIKE @q OR description LIKE @q)"
+      "(display_name LIKE :q OR original_filename LIKE :q OR series_name LIKE :q OR description LIKE :q)"
     );
-    params.q = `%${filters.q}%`;
+    args.q = `%${filters.q}%`;
   }
   if (filters.interior_pages) {
-    clauses.push("interior_pages = @interior_pages");
-    params.interior_pages = filters.interior_pages;
+    clauses.push("interior_pages = :interior_pages");
+    args.interior_pages = filters.interior_pages;
   }
 
   const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
-  return mapPhotos(
-    db
-      .prepare(`SELECT * FROM photos ${where} ORDER BY imported_at DESC`)
-      .all(params) as PhotoRow[]
+  return rowsToPhotos(
+    await execute(
+      `SELECT * FROM photos ${where} ORDER BY imported_at DESC, id DESC`,
+      args
+    )
   );
 }
 
-export function getPhoto(id: number): Photo | undefined {
-  return mapPhoto(
-    db.prepare("SELECT * FROM photos WHERE id = ?").get(id) as
-      | PhotoRow
-      | undefined
+export async function getPhoto(id: number): Promise<Photo | undefined> {
+  if (!Number.isInteger(id)) return undefined;
+  return rowsToPhotos(
+    await execute("SELECT * FROM photos WHERE id = ?", [id])
+  )[0];
+}
+
+export async function getPhotos(ids: number[]): Promise<Photo[]> {
+  const validIds = ids.filter(Number.isInteger);
+  if (validIds.length === 0) return [];
+  const placeholders = validIds.map(() => "?").join(",");
+  return rowsToPhotos(
+    await execute(
+      `SELECT * FROM photos WHERE id IN (${placeholders})`,
+      validIds
+    )
   );
 }
 
-export function getPhotos(ids: number[]): Photo[] {
-  if (ids.length === 0) return [];
-  const placeholders = ids.map(() => "?").join(",");
-  return mapPhotos(
-    db
-      .prepare(`SELECT * FROM photos WHERE id IN (${placeholders})`)
-      .all(...ids) as PhotoRow[]
-  );
-}
-
-export function insertPhoto(input: {
+export async function insertPhoto(input: {
   display_name: string;
   original_filename: string;
-  category: string;
   file_ext: string;
   file_size: number;
+  photo_url: string;
+  thumbnail_url: string;
   width: number | null;
   height: number | null;
-}): Photo {
-  const result = db
-    .prepare(
-      `INSERT INTO photos (display_name, original_filename, category, file_ext, file_size, width, height)
-       VALUES (@display_name, @original_filename, @category, @file_ext, @file_size, @width, @height)`
-    )
-    .run(input);
-  return getPhoto(Number(result.lastInsertRowid))!;
+  original_created_at: string;
+}): Promise<Photo> {
+  const result = await execute(
+    `INSERT INTO photos (display_name, original_filename, file_ext, file_size, photo_url, thumbnail_url, width, height, original_created_at)
+     VALUES (:display_name, :original_filename, :file_ext, :file_size, :photo_url, :thumbnail_url, :width, :height, :original_created_at)
+     RETURNING *`,
+    input
+  );
+  return rowsToPhotos(result)[0];
 }
 
 export type PhotoUpdates = Partial<{
   display_name: string;
-  category: string;
   series_name: string;
   series_release_date: string | null;
   colors: string[];
@@ -159,7 +177,6 @@ export type PhotoUpdates = Partial<{
 
 const PHOTO_UPDATE_KEYS = [
   "display_name",
-  "category",
   "series_name",
   "series_release_date",
   "colors",
@@ -178,79 +195,44 @@ const PHOTO_UPDATE_KEYS = [
   "raw_material",
 ] as const satisfies readonly (keyof PhotoUpdates)[];
 
-export function updatePhoto(id: number, updates: PhotoUpdates): Photo | undefined {
-  const payload: Record<string, unknown> = { id };
+export async function updatePhoto(
+  id: number,
+  updates: PhotoUpdates
+): Promise<Photo | undefined> {
+  const args: Record<string, InValue> = { id };
   const fields: string[] = [];
 
   for (const key of PHOTO_UPDATE_KEYS) {
     if (!Object.prototype.hasOwnProperty.call(updates, key)) continue;
-    fields.push(`${key} = @${key}`);
-    payload[key] =
-      key === "colors" ? JSON.stringify(updates.colors ?? []) : updates[key];
+    fields.push(`${key} = :${key}`);
+    args[key] =
+      key === "colors"
+        ? JSON.stringify(updates.colors ?? [])
+        : ((updates[key] ?? null) as InValue);
   }
 
   if (fields.length === 0) return getPhoto(id);
 
-  db.prepare(
-    `UPDATE photos SET ${fields.join(", ")}, updated_at = datetime('now') WHERE id = @id`
-  ).run(payload);
+  await execute(
+    `UPDATE photos SET ${fields.join(", ")}, updated_at = datetime('now') WHERE id = :id`,
+    args
+  );
   return getPhoto(id);
 }
 
-export function updatePhotoDimensions(
-  id: number,
-  width: number | null,
-  height: number | null
-): void {
-  db.prepare("UPDATE photos SET width = ?, height = ? WHERE id = ?").run(
-    width,
-    height,
-    id
-  );
-}
-
-export function updatePhotoOriginalCreatedAt(
-  id: number,
-  originalCreatedAt: string
-): void {
-  db.prepare("UPDATE photos SET original_created_at = ? WHERE id = ?").run(
-    originalCreatedAt,
-    id
-  );
-}
-
-export function listPhotosNeedingOriginalCreatedAt(): Photo[] {
-  return mapPhotos(
-    db
-      .prepare(
-        "SELECT * FROM photos WHERE original_created_at IS NULL ORDER BY id"
-      )
-      .all() as PhotoRow[]
-  );
-}
-
-export function bulkUpdateInteriorPages(
+export async function bulkUpdateInteriorPages(
   ids: number[],
   interiorPages: string
-): void {
-  if (ids.length === 0) return;
-  const placeholders = ids.map(() => "?").join(",");
-  db.prepare(
-    `UPDATE photos SET interior_pages = ?, updated_at = datetime('now') WHERE id IN (${placeholders})`
-  ).run(interiorPages, ...ids);
+): Promise<void> {
+  const validIds = ids.filter(Number.isInteger);
+  if (validIds.length === 0) return;
+  const placeholders = validIds.map(() => "?").join(",");
+  await execute(
+    `UPDATE photos SET interior_pages = ?, updated_at = datetime('now') WHERE id IN (${placeholders})`,
+    [interiorPages, ...validIds]
+  );
 }
 
-export function deletePhoto(id: number): void {
-  db.prepare("DELETE FROM photos WHERE id = ?").run(id);
+export async function deletePhoto(id: number): Promise<void> {
+  await execute("DELETE FROM photos WHERE id = ?", [id]);
 }
-
-export function listCategories(): string[] {
-  const rows = db
-    .prepare(
-      "SELECT DISTINCT category FROM photos ORDER BY category COLLATE NOCASE"
-    )
-    .all() as { category: string }[];
-  return rows.map((r) => r.category);
-}
-
-export default db;
