@@ -1,6 +1,11 @@
 import "server-only";
 import fs from "node:fs";
-import { createClient, type InValue, type ResultSet } from "@libsql/client";
+import {
+  createClient,
+  type Client,
+  type InValue,
+  type ResultSet,
+} from "@libsql/client";
 import { parseColors } from "@/lib/productFields";
 import type { Photo } from "@/lib/types";
 
@@ -16,10 +21,16 @@ function databaseUrl(): string {
   return LOCAL_DB_URL;
 }
 
-const client = createClient({
-  url: databaseUrl(),
-  authToken: process.env.TURSO_AUTH_TOKEN,
-});
+// Created on first use so builds don't need database credentials.
+let client: Client | null = null;
+
+function getClient(): Client {
+  client ??= createClient({
+    url: databaseUrl(),
+    authToken: process.env.TURSO_AUTH_TOKEN,
+  });
+  return client;
+}
 
 const SCHEMA = `
   CREATE TABLE IF NOT EXISTS photos (
@@ -59,7 +70,7 @@ const SCHEMA = `
 let schemaReady: Promise<void> | null = null;
 
 function ensureSchema(): Promise<void> {
-  schemaReady ??= client.executeMultiple(SCHEMA).catch((err) => {
+  schemaReady ??= getClient().executeMultiple(SCHEMA).catch((err) => {
     schemaReady = null;
     throw err;
   });
@@ -71,7 +82,7 @@ async function execute(
   args: InValue[] | Record<string, InValue> = []
 ): Promise<ResultSet> {
   await ensureSchema();
-  return client.execute({ sql, args });
+  return getClient().execute({ sql, args });
 }
 
 interface PhotoRow extends Omit<Photo, "colors"> {
