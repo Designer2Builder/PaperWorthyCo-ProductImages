@@ -33,6 +33,7 @@ export async function POST(request: NextRequest) {
     });
     return NextResponse.json(result);
   } catch (err) {
+    console.error("Upload token request failed:", err);
     return NextResponse.json(
       { error: (err as Error).message },
       { status: 400 }
