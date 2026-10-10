@@ -63,23 +63,50 @@ export function ImportClient() {
   const [productValues, setProductValues] =
     useState<ProductFormValues>(EMPTY_PRODUCT_FORM);
 
-  const loadFiles = useCallback(async () => {
-    const res = await fetch("/api/incoming");
-    const data = await res.json();
-    setFiles(data.files ?? []);
+  const [listError, setListError] = useState<string | null>(null);
+  const [uploadedCount, setUploadedCount] = useState(0);
+
+  const fetchFiles = useCallback(async (): Promise<
+    { files: IncomingFile[] } | { error: string }
+  > => {
+    try {
+      const res = await fetch("/api/incoming");
+      if (res.redirected && new URL(res.url).pathname === "/login") {
+        return { error: "Your session expired. Reload the page and log in again." };
+      }
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !Array.isArray(data.files)) {
+        return {
+          error: data.error || `Could not load staged files (status ${res.status}).`,
+        };
+      }
+      return { files: data.files };
+    } catch {
+      return { error: "Could not load staged files. Check your connection." };
+    }
   }, []);
+
+  const loadFiles = useCallback(async () => {
+    const result = await fetchFiles();
+    if ("error" in result) {
+      setListError(result.error);
+    } else {
+      setListError(null);
+      setFiles(result.files);
+    }
+  }, [fetchFiles]);
 
   useEffect(() => {
     let cancelled = false;
-    (async () => {
-      const res = await fetch("/api/incoming");
-      const data = await res.json();
-      if (!cancelled) setFiles(data.files ?? []);
-    })();
+    fetchFiles().then((result) => {
+      if (cancelled) return;
+      if ("error" in result) setListError(result.error);
+      else setFiles(result.files);
+    });
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [fetchFiles]);
 
   async function handleFilesSelected(fileList: FileList | null) {
     if (!fileList || fileList.length === 0) return;
@@ -88,6 +115,15 @@ export function ImportClient() {
     setImportResult(null);
     setUploadSkipped(selectedFiles.length - images.length);
     setUploadError(null);
+    setUploadedCount(0);
+
+    if (images.length === 0) {
+      setUploadError(
+        "None of the selected files are JPG, PNG, GIF, or WebP images, so nothing was uploaded. iPhone HEIC photos need to be exported as JPG first."
+      );
+      if (fileInputRef.current) fileInputRef.current.value = "";
+      return;
+    }
 
     let done = 0;
     const failures: string[] = [];
@@ -116,6 +152,7 @@ export function ImportClient() {
         `${failures.length} file${failures.length === 1 ? "" : "s"} failed to upload. ${failures.join("; ")}`
       );
     }
+    setUploadedCount(images.length - failures.length);
     setUploadProgress(null);
     if (fileInputRef.current) fileInputRef.current.value = "";
     await loadFiles();
@@ -196,6 +233,11 @@ export function ImportClient() {
             Uploading {uploadProgress.done} / {uploadProgress.total}...
           </p>
         )}
+        {!uploadProgress && uploadedCount > 0 && (
+          <p className="mt-2 text-sm text-green-600">
+            Uploaded {uploadedCount} photo{uploadedCount === 1 ? "" : "s"}.
+          </p>
+        )}
         {!uploadProgress && uploadSkipped > 0 && (
           <p className="mt-2 text-sm text-neutral-500">
             Skipped {uploadSkipped} non-image file
@@ -204,6 +246,9 @@ export function ImportClient() {
         )}
         {uploadError && (
           <p className="mt-2 text-sm text-red-600">{uploadError}</p>
+        )}
+        {listError && (
+          <p className="mt-2 text-sm text-red-600">{listError}</p>
         )}
       </div>
 
