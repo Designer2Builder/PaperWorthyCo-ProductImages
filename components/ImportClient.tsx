@@ -49,6 +49,7 @@ export function ImportClient() {
   const [uploadProgress, setUploadProgress] = useState<{
     done: number;
     total: number;
+    percent: number;
   } | null>(null);
   const [importProgress, setImportProgress] = useState<{
     done: number;
@@ -127,7 +128,19 @@ export function ImportClient() {
 
     let done = 0;
     const failures: string[] = [];
-    setUploadProgress({ done, total: images.length });
+    const totalBytes = images.reduce((sum, f) => sum + f.size, 0);
+    const loadedBytes = new Map<File, number>();
+    const report = () =>
+      setUploadProgress({
+        done,
+        total: images.length,
+        percent: Math.round(
+          (Array.from(loadedBytes.values()).reduce((a, b) => a + b, 0) /
+            Math.max(totalBytes, 1)) *
+            100
+        ),
+      });
+    report();
 
     await runWithConcurrency(images, UPLOAD_CONCURRENCY, async (file) => {
       try {
@@ -138,13 +151,19 @@ export function ImportClient() {
             access: "public",
             handleUploadUrl: "/api/incoming/upload",
             multipart: file.size > 5 * 1024 * 1024,
+            onUploadProgress: ({ loaded }) => {
+              loadedBytes.set(file, loaded);
+              report();
+            },
           }
         );
+        loadedBytes.set(file, file.size);
       } catch (err) {
-        failures.push(`${file.name}: ${(err as Error).message}`);
+        const error = err as Error;
+        failures.push(`${file.name}: ${error.name}: ${error.message}`);
       }
       done += 1;
-      setUploadProgress({ done, total: images.length });
+      report();
     });
 
     if (failures.length > 0) {
@@ -230,7 +249,8 @@ export function ImportClient() {
         />
         {uploadProgress && (
           <p className="mt-2 text-sm text-neutral-500">
-            Uploading {uploadProgress.done} / {uploadProgress.total}...
+            Uploading {uploadProgress.done} / {uploadProgress.total} (
+            {uploadProgress.percent}%)...
           </p>
         )}
         {!uploadProgress && uploadedCount > 0 && (
