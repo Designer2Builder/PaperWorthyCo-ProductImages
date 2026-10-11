@@ -139,8 +139,9 @@ async function readIncomingFile(
 }
 
 /**
- * Moves a staged upload into permanent storage, generates its thumbnail, and
- * reads its metadata. The staged parts are removed once both copies exist.
+ * Copies a staged upload into permanent storage, generates its thumbnail, and
+ * reads its metadata. The staged parts are left in place; the caller removes
+ * them with `deleteBlobs(partUrls)` once the photo is saved.
  */
 export async function promoteIncomingFile(pathname: string): Promise<{
   name: string;
@@ -151,6 +152,7 @@ export async function promoteIncomingFile(pathname: string): Promise<{
   width: number | null;
   height: number | null;
   originalCreatedAt: string | null;
+  partUrls: string[];
 }> {
   const { buffer, partUrls } = await readIncomingFile(pathname);
 
@@ -187,9 +189,9 @@ export async function promoteIncomingFile(pathname: string): Promise<{
   );
 
   const metadata = await getImageMetadata(buffer);
-  await deleteBlobs(partUrls);
 
   return {
+    partUrls,
     name,
     ext,
     size: buffer.length,

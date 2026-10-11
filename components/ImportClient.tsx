@@ -13,6 +13,7 @@ import {
 const UPLOAD_CONCURRENCY = 3;
 const CHUNK_BYTES = 4 * 1024 * 1024; // must match MAX_CHUNK_BYTES in lib/storage.ts
 const MAX_FILE_BYTES = 100 * 1024 * 1024;
+const CHUNK_ATTEMPTS = 3;
 
 async function uploadInChunks(file: File): Promise<void> {
   const pathname = `incoming/${crypto.randomUUID()}/${safeFilename(file.name)}`;
@@ -23,14 +24,21 @@ async function uploadInChunks(file: File): Promise<void> {
       index: String(index),
       total: String(total),
     });
-    const res = await fetch(`/api/incoming/upload?${params}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/octet-stream" },
-      body: file.slice(index * CHUNK_BYTES, (index + 1) * CHUNK_BYTES),
-    });
-    if (!res.ok) {
-      const data = await res.json().catch(() => ({}));
-      throw new Error(data.error || `Upload failed (status ${res.status})`);
+    const chunk = file.slice(index * CHUNK_BYTES, (index + 1) * CHUNK_BYTES);
+    for (let attempt = 1; ; attempt++) {
+      try {
+        const res = await fetch(`/api/incoming/upload?${params}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/octet-stream" },
+          body: chunk,
+        });
+        if (res.ok) break;
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || `Upload failed (status ${res.status})`);
+      } catch (err) {
+        if (attempt >= CHUNK_ATTEMPTS) throw err;
+        await new Promise((resolve) => setTimeout(resolve, attempt * 1000));
+      }
     }
   }
 }

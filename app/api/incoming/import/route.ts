@@ -53,6 +53,9 @@ export async function POST(request: NextRequest) {
       Object.keys(updates).length > 0
         ? await updatePhoto(photo.id, updates)
         : photo;
+    await deleteBlobs(promoted.partUrls).catch((err) => {
+      console.error("Removing staged upload failed:", err);
+    });
     return NextResponse.json({ photo: saved });
   } catch (err) {
     await deleteBlobs([promoted.photoUrl, promoted.thumbnailUrl]);
