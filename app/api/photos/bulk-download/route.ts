@@ -102,7 +102,6 @@ export async function POST(request: NextRequest) {
         access: "public",
         addRandomSuffix: true,
         contentType: "application/zip",
-        multipart: true,
       }),
       fill,
     ]);

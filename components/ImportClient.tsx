@@ -2,7 +2,6 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { upload } from "@vercel/blob/client";
 import type { IncomingFile } from "@/lib/types";
 import {
   EMPTY_PRODUCT_FORM,
@@ -12,6 +11,29 @@ import {
 } from "@/components/ProductFieldsForm";
 
 const UPLOAD_CONCURRENCY = 3;
+const CHUNK_BYTES = 4 * 1024 * 1024; // must match MAX_CHUNK_BYTES in lib/storage.ts
+const MAX_FILE_BYTES = 100 * 1024 * 1024;
+
+async function uploadInChunks(file: File): Promise<void> {
+  const pathname = `incoming/${crypto.randomUUID()}/${safeFilename(file.name)}`;
+  const total = Math.max(1, Math.ceil(file.size / CHUNK_BYTES));
+  for (let index = 0; index < total; index++) {
+    const params = new URLSearchParams({
+      pathname,
+      index: String(index),
+      total: String(total),
+    });
+    const res = await fetch(`/api/incoming/upload?${params}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: file.slice(index * CHUNK_BYTES, (index + 1) * CHUNK_BYTES),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.error || `Upload failed (status ${res.status})`);
+    }
+  }
+}
 const IMAGE_FILE = /\.(jpe?g|png|gif|webp)$/i;
 
 function safeFilename(name: string): string {
@@ -131,18 +153,13 @@ export function ImportClient() {
 
     await runWithConcurrency(images, UPLOAD_CONCURRENCY, async (file) => {
       try {
-        await upload(
-          `incoming/${crypto.randomUUID()}/${safeFilename(file.name)}`,
-          file,
-          {
-            access: "public",
-            handleUploadUrl: "/api/incoming/upload",
-          }
-        );
+        if (file.size > MAX_FILE_BYTES) {
+          throw new Error("Larger than the 100 MB limit");
+        }
+        await uploadInChunks(file);
       } catch (err) {
-        const error = err as Error;
         failures.push(
-          `${file.name} (${formatBytes(file.size)}): ${error.name}: ${error.message}`
+          `${file.name} (${formatBytes(file.size)}): ${(err as Error).message}`
         );
       }
       done += 1;

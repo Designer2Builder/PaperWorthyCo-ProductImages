@@ -2,23 +2,35 @@ import "server-only";
 import crypto from "node:crypto";
 import path from "node:path";
 import sharp from "sharp";
-import { copy, del, head, list, put } from "@vercel/blob";
+import { del, list, put, type ListBlobResultBlob } from "@vercel/blob";
 import type { IncomingFile } from "@/lib/types";
 
-export const IMAGE_CONTENT_TYPES = [
-  "image/jpeg",
-  "image/png",
-  "image/gif",
-  "image/webp",
-];
+const CONTENT_TYPES: Record<string, string> = {
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  png: "image/png",
+  gif: "image/gif",
+  webp: "image/webp",
+};
 export const MAX_UPLOAD_BYTES = 100 * 1024 * 1024; // 100MB per photo
+/** Kept under Vercel's 4.5MB function request body limit. */
+export const MAX_CHUNK_BYTES = 4 * 1024 * 1024;
 
 const INCOMING_PREFIX = "incoming/";
-const INCOMING_PATHNAME =
-  /^incoming\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/[^/]+$/;
+const UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+const INCOMING_PATHNAME = new RegExp(`^incoming/${UUID}/[^/]+$`);
+// Staged files are stored as numbered parts under their pathname, e.g.
+// incoming/<uuid>/IMG_1.jpg/part-0-of-3, and joined back together on import.
+const INCOMING_PART = new RegExp(
+  `^(incoming/${UUID}/[^/]+)/part-(\\d+)-of-(\\d+)$`
+);
 
 export function isIncomingPathname(pathname: string): boolean {
-  return INCOMING_PATHNAME.test(pathname) && !pathname.includes("..");
+  return (
+    INCOMING_PATHNAME.test(pathname) &&
+    !pathname.includes("..") &&
+    Object.hasOwn(CONTENT_TYPES, extFromFilename(pathname))
+  );
 }
 
 export function extFromFilename(filename: string): string {
@@ -26,37 +38,109 @@ export function extFromFilename(filename: string): string {
   return ext || "jpg";
 }
 
-export async function listIncomingFiles(): Promise<IncomingFile[]> {
-  const files: IncomingFile[] = [];
+async function listAll(prefix: string): Promise<ListBlobResultBlob[]> {
+  const blobs: ListBlobResultBlob[] = [];
   let cursor: string | undefined;
   do {
-    const page = await list({ prefix: INCOMING_PREFIX, cursor, limit: 1000 });
-    for (const blob of page.blobs) {
-      if (!isIncomingPathname(blob.pathname)) continue;
-      files.push({
-        pathname: blob.pathname,
-        name: path.posix.basename(blob.pathname),
-        size: blob.size,
-      });
-    }
+    const page = await list({ prefix, cursor, limit: 1000 });
+    blobs.push(...page.blobs);
     cursor = page.hasMore ? page.cursor : undefined;
   } while (cursor);
+  return blobs;
+}
+
+export async function saveIncomingChunk(
+  pathname: string,
+  index: number,
+  total: number,
+  data: Buffer
+): Promise<void> {
+  await put(`${pathname}/part-${index}-of-${total}`, data, {
+    access: "public",
+    addRandomSuffix: false,
+    allowOverwrite: true,
+    contentType: "application/octet-stream",
+  });
+}
+
+/** Lists staged files whose parts have all been uploaded. */
+export async function listIncomingFiles(): Promise<IncomingFile[]> {
+  const groups = new Map<string, { total: number; parts: Set<number>; size: number }>();
+  for (const blob of await listAll(INCOMING_PREFIX)) {
+    const match = blob.pathname.match(INCOMING_PART);
+    if (!match) continue;
+    const [, pathname, index, total] = match;
+    const group = groups.get(pathname) ?? {
+      total: Number(total),
+      parts: new Set<number>(),
+      size: 0,
+    };
+    group.parts.add(Number(index));
+    group.size += blob.size;
+    groups.set(pathname, group);
+  }
+
+  const files: IncomingFile[] = [];
+  for (const [pathname, group] of groups) {
+    if (group.parts.size !== group.total) continue;
+    files.push({
+      pathname,
+      name: path.posix.basename(pathname),
+      size: group.size,
+    });
+  }
   return files.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+async function listIncomingParts(pathname: string): Promise<ListBlobResultBlob[]> {
+  return (await listAll(`${pathname}/`)).filter((b) =>
+    INCOMING_PART.test(b.pathname)
+  );
 }
 
 export async function removeIncomingFile(pathname: string): Promise<void> {
   if (!isIncomingPathname(pathname)) return;
-  await del(pathname);
+  await deleteBlobs((await listIncomingParts(pathname)).map((b) => b.url));
 }
 
 export async function clearIncomingFiles(): Promise<void> {
-  const files = await listIncomingFiles();
-  if (files.length > 0) await del(files.map((f) => f.pathname));
+  await deleteBlobs((await listAll(INCOMING_PREFIX)).map((b) => b.url));
+}
+
+async function readIncomingFile(
+  pathname: string
+): Promise<{ buffer: Buffer; partUrls: string[] }> {
+  const parts = (await listIncomingParts(pathname))
+    .map((blob) => {
+      const [, , index, total] = blob.pathname.match(INCOMING_PART)!;
+      return { url: blob.url, index: Number(index), total: Number(total) };
+    })
+    .sort((a, b) => a.index - b.index);
+
+  const total = parts[0]?.total ?? 0;
+  if (
+    parts.length === 0 ||
+    parts.length !== total ||
+    parts.some((p, i) => p.index !== i || p.total !== total)
+  ) {
+    throw new Error("Upload is incomplete. Remove it and upload it again.");
+  }
+
+  const buffers = await Promise.all(
+    parts.map(async (part) => {
+      const res = await fetch(part.url, { cache: "no-store" });
+      if (!res.ok) {
+        throw new Error(`Could not read upload (status ${res.status})`);
+      }
+      return Buffer.from(await res.arrayBuffer());
+    })
+  );
+  return { buffer: Buffer.concat(buffers), partUrls: parts.map((p) => p.url) };
 }
 
 /**
  * Moves a staged upload into permanent storage, generates its thumbnail, and
- * reads its metadata. The staged blob is removed once both copies exist.
+ * reads its metadata. The staged parts are removed once both copies exist.
  */
 export async function promoteIncomingFile(pathname: string): Promise<{
   name: string;
@@ -68,10 +152,7 @@ export async function promoteIncomingFile(pathname: string): Promise<{
   height: number | null;
   originalCreatedAt: string | null;
 }> {
-  const incoming = await head(pathname);
-  const res = await fetch(incoming.url, { cache: "no-store" });
-  if (!res.ok) throw new Error(`Could not read upload (status ${res.status})`);
-  const buffer = Buffer.from(await res.arrayBuffer());
+  const { buffer, partUrls } = await readIncomingFile(pathname);
 
   const name = path.posix.basename(pathname);
   const ext = extFromFilename(name);
@@ -83,10 +164,10 @@ export async function promoteIncomingFile(pathname: string): Promise<{
     .toBuffer();
 
   const results = await Promise.allSettled([
-    copy(incoming.url, `photos/${key}.${ext}`, {
+    put(`photos/${key}.${ext}`, buffer, {
       access: "public",
       addRandomSuffix: true,
-      contentType: incoming.contentType,
+      contentType: CONTENT_TYPES[ext],
     }),
     put(`thumbnails/${key}.webp`, thumbnail, {
       access: "public",
@@ -106,12 +187,12 @@ export async function promoteIncomingFile(pathname: string): Promise<{
   );
 
   const metadata = await getImageMetadata(buffer);
-  await del(incoming.url);
+  await deleteBlobs(partUrls);
 
   return {
     name,
     ext,
-    size: incoming.size,
+    size: buffer.length,
     photoUrl: photoBlob.url,
     thumbnailUrl: thumbnailBlob.url,
     ...metadata,
