@@ -11,24 +11,46 @@ import type { Photo } from "@/lib/types";
 
 const LOCAL_DB_URL = "file:data/catalog.db";
 
-function databaseUrl(): string {
-  const url = process.env.TURSO_DATABASE_URL;
-  if (url) return url;
-  if (process.env.VERCEL) {
-    throw new Error("TURSO_DATABASE_URL environment variable is not set");
+/**
+ * Finds the Turso connection settings. The Vercel Marketplace integration can
+ * add a custom prefix to its variable names (e.g. STORAGE_TURSO_DATABASE_URL),
+ * so this falls back to any variable holding a libsql:// URL and the auth
+ * token that shares its prefix.
+ */
+function databaseConfig(): { url: string; authToken?: string } {
+  const env = process.env;
+  if (env.TURSO_DATABASE_URL) {
+    return { url: env.TURSO_DATABASE_URL, authToken: env.TURSO_AUTH_TOKEN };
+  }
+
+  const urlKey = Object.keys(env).find((key) =>
+    env[key]?.startsWith("libsql://")
+  );
+  if (urlKey) {
+    const prefix = urlKey.replace(/(DATABASE_)?URL$/, "");
+    const tokenKey =
+      [`${prefix}AUTH_TOKEN`, `${prefix}TOKEN`].find((key) => env[key]) ??
+      Object.keys(env).find((key) => key.endsWith("TURSO_AUTH_TOKEN"));
+    return {
+      url: env[urlKey]!,
+      authToken: tokenKey ? env[tokenKey] : undefined,
+    };
+  }
+
+  if (env.VERCEL) {
+    throw new Error(
+      "No Turso database is connected (no environment variable holds a libsql:// URL)"
+    );
   }
   fs.mkdirSync("data", { recursive: true });
-  return LOCAL_DB_URL;
+  return { url: LOCAL_DB_URL };
 }
 
 // Created on first use so builds don't need database credentials.
 let client: Client | null = null;
 
 function getClient(): Client {
-  client ??= createClient({
-    url: databaseUrl(),
-    authToken: process.env.TURSO_AUTH_TOKEN,
-  });
+  client ??= createClient(databaseConfig());
   return client;
 }
 
