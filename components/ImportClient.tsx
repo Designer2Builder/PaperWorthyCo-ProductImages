@@ -49,7 +49,6 @@ export function ImportClient() {
   const [uploadProgress, setUploadProgress] = useState<{
     done: number;
     total: number;
-    percent: number;
   } | null>(null);
   const [importProgress, setImportProgress] = useState<{
     done: number;
@@ -128,19 +127,7 @@ export function ImportClient() {
 
     let done = 0;
     const failures: string[] = [];
-    const totalBytes = images.reduce((sum, f) => sum + f.size, 0);
-    const loadedBytes = new Map<File, number>();
-    const report = () =>
-      setUploadProgress({
-        done,
-        total: images.length,
-        percent: Math.round(
-          (Array.from(loadedBytes.values()).reduce((a, b) => a + b, 0) /
-            Math.max(totalBytes, 1)) *
-            100
-        ),
-      });
-    report();
+    setUploadProgress({ done, total: images.length });
 
     await runWithConcurrency(images, UPLOAD_CONCURRENCY, async (file) => {
       try {
@@ -150,13 +137,8 @@ export function ImportClient() {
           {
             access: "public",
             handleUploadUrl: "/api/incoming/upload",
-            onUploadProgress: ({ loaded }) => {
-              loadedBytes.set(file, loaded);
-              report();
-            },
           }
         );
-        loadedBytes.set(file, file.size);
       } catch (err) {
         const error = err as Error;
         failures.push(
@@ -164,7 +146,7 @@ export function ImportClient() {
         );
       }
       done += 1;
-      report();
+      setUploadProgress({ done, total: images.length });
     });
 
     if (failures.length > 0) {
@@ -250,8 +232,7 @@ export function ImportClient() {
         />
         {uploadProgress && (
           <p className="mt-2 text-sm text-neutral-500">
-            Uploading {uploadProgress.done} / {uploadProgress.total} (
-            {uploadProgress.percent}%)...
+            Uploading {uploadProgress.done} / {uploadProgress.total}...
           </p>
         )}
         {!uploadProgress && uploadedCount > 0 && (
