@@ -150,7 +150,6 @@ export function ImportClient() {
           {
             access: "public",
             handleUploadUrl: "/api/incoming/upload",
-            multipart: file.size > 5 * 1024 * 1024,
             onUploadProgress: ({ loaded }) => {
               loadedBytes.set(file, loaded);
               report();
@@ -160,7 +159,9 @@ export function ImportClient() {
         loadedBytes.set(file, file.size);
       } catch (err) {
         const error = err as Error;
-        failures.push(`${file.name}: ${error.name}: ${error.message}`);
+        failures.push(
+          `${file.name} (${formatBytes(file.size)}): ${error.name}: ${error.message}`
+        );
       }
       done += 1;
       report();
